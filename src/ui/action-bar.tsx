@@ -34,15 +34,14 @@ export const ActionBar: Component<ActionBarProps> = (props) => {
   const minRaise = createMemo(() => props.snapshot.minRaise);
   const maxBet = createMemo(() => me()?.stack ?? 0);
 
-  // Bet amount state: default to pot-sized (toCall + pot).
   const [betAmount, setBetAmount] = createSignal<number>(0);
   const potSized = createMemo(() =>
     Math.min(maxBet(), props.snapshot.pot + toCall()),
   );
-  const [selectedPreset, setSelectedPreset] = createSignal<number>(2);
+  const [selectedPreset, setSelectedPreset] = createSignal<number>(-1);
 
-  const applyPreset = (preset: number) => {
-    setSelectedPreset(preset);
+  const applyPreset = (preset: number, index: number) => {
+    setSelectedPreset(index);
     const target = Math.min(maxBet(), Math.floor(props.snapshot.pot * preset));
     setBetAmount(target);
   };
@@ -66,7 +65,7 @@ export const ActionBar: Component<ActionBarProps> = (props) => {
               <button
                 type="button"
                 class={`tp-btn tp-btn--preset ${selectedPreset() === i ? "tp-btn--preset-active" : ""}`}
-                onClick={() => applyPreset(p)}
+                onClick={() => applyPreset(p, i)}
               >
                 {Math.round(p * 100)}%
               </button>
@@ -112,7 +111,7 @@ export const ActionBar: Component<ActionBarProps> = (props) => {
           </button>
         </Show>
         <Show when={!myTurn()}>
-          <span class="tp-actionbar__status">
+          <span class="tp-actionbar__status" aria-live="polite">
             {props.snapshot.status === "handEnded" ||
             props.snapshot.status === "waiting"
               ? "等待下一手"
@@ -125,11 +124,7 @@ export const ActionBar: Component<ActionBarProps> = (props) => {
           <button
             type="button"
             class="tp-btn tp-btn--primary"
-            onClick={() => {
-              const amt = effectiveAmount();
-              if (amt >= maxBet()) props.onAction("bet", amt);
-              else props.onAction("bet", amt);
-            }}
+            onClick={() => props.onAction("bet", effectiveAmount())}
           >
             下注 {formatChips(effectiveAmount())}
           </button>

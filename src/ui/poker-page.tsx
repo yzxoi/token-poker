@@ -91,7 +91,7 @@ const PokerPage: Component<PluginSurfaceContext> = (props) => {
         <Show when={snapshot()}>
           <div class="tp-header__stats">
             <span>
-              {snapshot()!.players[0]?.name ?? "你"}:{" "}
+              {snapshot()!.players[0]?.name ?? "你"} ·{" "}
               {formatChips(snapshot()!.players[0]?.stack ?? 0)}
             </span>
           </div>

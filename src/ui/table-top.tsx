@@ -9,67 +9,109 @@ export interface TableTopProps {
   snapshot: GameSnapshot;
 }
 
-const SEAT_POSITIONS: Record<number, string> = {
-  0: "tp-seat--south",
-  1: "tp-seat--west",
-  2: "tp-seat--northwest",
-  3: "tp-seat--north",
-  4: "tp-seat--northeast",
-  5: "tp-seat--east",
-};
+/** Deterministic avatar hue per seat. */
+const AVATAR_TONES = [
+  "mint",
+  "cyan",
+  "purple",
+  "orange",
+  "pink",
+  "lime",
+] as const;
 
 export const TableTop: Component<TableTopProps> = (props) => {
   const activePlayers = createMemo(() => props.snapshot.players);
 
+  const seatStyle = (seat: number) => {
+    const n = activePlayers().length;
+    // Fan seats around the bottom half of the felt ellipse.
+    const angle = Math.PI * (0.5 + (seat / Math.max(n - 1, 1)) * 1.0);
+    const rx = 46;
+    const ry = 40;
+    return {
+      "--tp-seat-x": `${50 + Math.cos(angle) * rx}%`,
+      "--tp-seat-y": `${52 + Math.sin(angle) * ry}%`,
+      "--tp-avatar-tone": AVATAR_TONES[seat % AVATAR_TONES.length],
+    } as Record<string, string>;
+  };
+
   return (
     <div class="tp-table-wrap">
       <div class="tp-table" role="group" aria-label="牌桌">
-        {activePlayers().map((p) => {
-          const position = SEAT_POSITIONS[p.seat] ?? "tp-seat--south";
-          const isTurn =
-            props.snapshot.currentTurn === p.seat &&
-            props.snapshot.status !== "handEnded";
-          const isDealer = props.snapshot.dealerSeat === p.seat;
-          return (
-            <div
-              class={`tp-seat ${position} ${p.folded ? "tp-seat--folded" : ""} ${isTurn ? "tp-seat--turn" : ""} ${
-                p.allIn ? "tp-seat--allin" : ""
-              }`}
-            >
-              <div class="tp-seat__badges">
-                <Show when={isDealer}>
-                  <span class="tp-seat__dealer" title="庄家">
-                    D
-                  </span>
-                </Show>
-                <Show when={p.allIn}>
-                  <span class="tp-seat__allin">ALL-IN</span>
-                </Show>
-              </div>
-              <HoleCards cards={p.holeCards} small={p.isBot} />
-              <div class="tp-seat__name">{p.name}</div>
-              <div class="tp-seat__stack">{formatChips(p.stack)}</div>
-              <Show when={isTurn && p.isBot}>
-                <div class="tp-seat__thinking">● ● Thinking</div>
-              </Show>
-            </div>
-          );
-        })}
-
-        {/* Table center */}
+        {/* felt center */}
         <div class="tp-table__center">
-          <div class="tp-pot">Pot: {formatChips(props.snapshot.pot)}</div>
+          <div class="tp-pot" aria-live="polite">
+            <span class="tp-pot__label">Pot</span>
+            <span class="tp-pot__value">{formatChips(props.snapshot.pot)}</span>
+          </div>
           <CommunityCards
             cards={props.snapshot.communityCards}
             street={props.snapshot.status}
           />
           <Show when={props.snapshot.lastAction}>
-            <div class="tp-table__last-action">
+            <div class="tp-table__last-action" role="status">
               {props.snapshot.players[props.snapshot.lastAction!.seat]?.name}{" "}
               {props.snapshot.lastAction!.text}
             </div>
           </Show>
         </div>
+
+        {/* seats */}
+        {activePlayers().map((p) => {
+          const isTurn =
+            props.snapshot.currentTurn === p.seat &&
+            props.snapshot.status !== "handEnded";
+          const isDealer = props.snapshot.dealerSeat === p.seat;
+          const isUser = p.seat === 0;
+          const isWinner =
+            props.snapshot.status === "handEnded" &&
+            props.snapshot.lastResult?.winnerSeats.includes(p.seat);
+          return (
+            <div
+              class={`tp-seat ${p.folded ? "tp-seat--folded" : ""} ${isTurn ? "tp-seat--turn" : ""} ${
+                p.allIn ? "tp-seat--allin" : ""
+              } ${isWinner ? "tp-seat--winner" : ""}`}
+              style={seatStyle(p.seat)}
+            >
+              <Show when={isDealer}>
+                <span class="tp-seat__dealer" title="庄家">
+                  D
+                </span>
+              </Show>
+              <div
+                class="tp-seat__avatar"
+                data-tone={AVATAR_TONES[p.seat % AVATAR_TONES.length]}
+              >
+                {p.name.slice(0, 1).toUpperCase()}
+              </div>
+              <div class="tp-seat__meta">
+                <span class="tp-seat__name">{p.name}</span>
+                <span class="tp-seat__stack">{formatChips(p.stack)}</span>
+              </div>
+              <Show when={!p.folded}>
+                <HoleCards cards={p.holeCards} small={p.isBot} />
+              </Show>
+              <Show when={isTurn && p.isBot}>
+                <div
+                  class="tp-seat__thinking"
+                  role="status"
+                  aria-label="思考中"
+                >
+                  <span class="tp-seat__thinking-dot" />
+                  <span class="tp-seat__thinking-dot" />
+                  <span class="tp-seat__thinking-dot" />
+                  Thinking
+                </div>
+              </Show>
+              <Show when={p.allIn}>
+                <span class="tp-seat__allin">ALL-IN</span>
+              </Show>
+              <Show when={isUser && isWinner}>
+                <span class="tp-seat__win">WIN</span>
+              </Show>
+            </div>
+          );
+        })}
       </div>
 
       <Show
@@ -94,8 +136,13 @@ const ResultOverlay: Component<{ snapshot: GameSnapshot }> = (props) => {
       )
       .join("、"),
   );
+  const userWon = createMemo(() => result().winnerSeats.includes(0));
   return (
-    <div class="tp-result" role="status" aria-live="polite">
+    <div
+      class={`tp-result ${userWon() ? "tp-result--win" : ""}`}
+      role="status"
+      aria-live="polite"
+    >
       <div class="tp-result__title">
         {winners()} 赢得 {formatChips(props.snapshot.pot)}
       </div>
