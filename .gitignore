@@ -3,3 +3,4 @@ dist/
 *.tgz
 coverage/
 .DS_Store
+*.tgz.sig
