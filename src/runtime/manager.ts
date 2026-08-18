@@ -106,6 +106,21 @@ export class GameManager {
     return seats;
   }
 
+  /**
+   * Public snapshot for the UI: hides AI hole cards so opponents cannot be
+   * read. Showdown hands are still visible through `lastResult.showdown`.
+   */
+  private publicSnapshot(session: GameSession): GameSnapshot {
+    const snap = session.game.snapshot();
+    return {
+      ...snap,
+      players: snap.players.map((p) => ({
+        ...p,
+        holeCards: p.isBot ? null : p.holeCards,
+      })),
+    };
+  }
+
   /** Serialize all commands per session. */
   private async withLock<T>(
     session: GameSession,
@@ -160,7 +175,7 @@ export class GameManager {
         // Defensive: fallback to fold if the LLM action is invalid.
         session.game.applyAction(turn, { action: "fold" });
       }
-      this.publishChanged(context, session, session.game.snapshot());
+      this.publishChanged(context, session, this.publicSnapshot(session));
     }
   }
 
@@ -237,10 +252,9 @@ export class GameManager {
       seed: handSeed(session.nonce, session.handIndex++),
     });
     session.game.startHand();
-    const snap = session.game.snapshot();
-    this.publishChanged(context, session, snap);
+    this.publishChanged(context, session, this.publicSnapshot(session));
     await this.runAiLoop(context, session);
-    return session.game.snapshot();
+    return this.publicSnapshot(session);
   }
 
   /** Join the table (creates/restores a session). */
@@ -257,7 +271,7 @@ export class GameManager {
       if (session.game.snapshot().status === "waiting") {
         return this.startNewHand(context, session);
       }
-      const snap = session.game.snapshot();
+      const snap = this.publicSnapshot(session);
       this.publishChanged(context, session, snap);
       return snap;
     });
@@ -276,9 +290,9 @@ export class GameManager {
       }
       if (snap.currentTurn !== 0) throw new Error("还没轮到你");
       session.game.applyAction(0, input);
-      this.publishChanged(context, session, session.game.snapshot());
+      this.publishChanged(context, session, this.publicSnapshot(session));
       await this.runAiLoop(context, session);
-      return session.game.snapshot();
+      return this.publicSnapshot(session);
     });
   }
 
@@ -288,7 +302,7 @@ export class GameManager {
     return this.withLock(session, async () => {
       const snap = session.game.snapshot();
       if (snap.status !== "waiting" && snap.status !== "handEnded") {
-        return snap;
+        return this.publicSnapshot(session);
       }
       return this.startNewHand(context, session);
     });
@@ -300,7 +314,7 @@ export class GameManager {
     return this.withLock(session, async () => {
       const snap = session.game.snapshot();
       if (snap.status !== "waiting" && snap.status !== "handEnded") {
-        session.stored.recovery = snap;
+        session.stored.recovery = this.publicSnapshot(session);
       }
       await saveState(context, session.stored);
       this.sessions.delete(context.scopeId);
@@ -314,7 +328,7 @@ export class GameManager {
     if (snap.status === "waiting") {
       return this.withLock(session, () => this.startNewHand(context, session));
     }
-    return snap;
+    return this.publicSnapshot(session);
   }
 
   /** Stats for the UI. */

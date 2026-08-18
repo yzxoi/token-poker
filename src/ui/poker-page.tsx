@@ -8,18 +8,18 @@ import { ActionBar } from "./action-bar";
 import { formatChips } from "./format";
 import "./poker.css";
 
-export interface PokerPageProps {
-  context: PluginSurfaceContext;
-}
-
-const PokerPage: Component<PokerPageProps> = (props) => {
+/**
+ * The host passes the PluginSurfaceContext directly as this component's props
+ * (createComponent(loaded.default, context)), not as { context: ... }.
+ */
+const PokerPage: Component<PluginSurfaceContext> = (props) => {
   const [snapshot, setSnapshot] = createSignal<GameSnapshot | null>(null);
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
 
   const refresh = async () => {
     try {
-      const snap = (await props.context.operations.query(
+      const snap = (await props.operations.query(
         "game.get",
         {},
       )) as GameSnapshot;
@@ -32,7 +32,7 @@ const PokerPage: Component<PokerPageProps> = (props) => {
 
   onMount(async () => {
     try {
-      const snap = (await props.context.operations.command(
+      const snap = (await props.operations.command(
         "game.join",
         {},
       )) as GameSnapshot;
@@ -40,12 +40,9 @@ const PokerPage: Component<PokerPageProps> = (props) => {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
-    const unsubscribe = props.context.events.subscribe(
-      "game.state.changed",
-      () => {
-        void refresh();
-      },
-    );
+    const unsubscribe = props.events.subscribe("game.state.changed", () => {
+      void refresh();
+    });
     onCleanup(unsubscribe);
   });
 
@@ -55,7 +52,7 @@ const PokerPage: Component<PokerPageProps> = (props) => {
   ) => {
     setBusy(true);
     try {
-      const snap = (await props.context.operations.command("game.action", {
+      const snap = (await props.operations.command("game.action", {
         action,
         amount,
       })) as GameSnapshot;
@@ -71,7 +68,7 @@ const PokerPage: Component<PokerPageProps> = (props) => {
   const newHand = async () => {
     setBusy(true);
     try {
-      const snap = (await props.context.operations.command(
+      const snap = (await props.operations.command(
         "game.newHand",
         {},
       )) as GameSnapshot;
@@ -94,7 +91,7 @@ const PokerPage: Component<PokerPageProps> = (props) => {
         <Show when={snapshot()}>
           <div class="tp-header__stats">
             <span>
-              手牌 {snapshot()!.players[0]?.name ?? "你"}:{" "}
+              {snapshot()!.players[0]?.name ?? "你"}:{" "}
               {formatChips(snapshot()!.players[0]?.stack ?? 0)}
             </span>
           </div>

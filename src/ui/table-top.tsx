@@ -49,7 +49,7 @@ export const TableTop: Component<TableTopProps> = (props) => {
               <HoleCards cards={p.holeCards} small={p.isBot} />
               <div class="tp-seat__name">{p.name}</div>
               <div class="tp-seat__stack">{formatChips(p.stack)}</div>
-              <Show when={isTurn && !p.isBot}>
+              <Show when={isTurn && p.isBot}>
                 <div class="tp-seat__thinking">● ● Thinking</div>
               </Show>
             </div>
