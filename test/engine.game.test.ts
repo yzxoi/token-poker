@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Game } from "../src/engine/game";
+import { compareHands, evaluate } from "../src/engine/evaluate";
 
 function makeGame(overrides?: {
   stacks?: number[];
@@ -43,7 +44,16 @@ function callOrCheckUntil(game: Game, stopStatus: string, safety = 60): void {
   let n = 0;
   while (game.snapshot().status !== stopStatus && n < safety) {
     const s = game.snapshot();
-    const seat = s.currentTurn!;
+    if (s.currentTurn === null) {
+      // Lazy all-in runout: deal the next board street explicitly.
+      if (game.needsRunout()) {
+        game.advanceRunout();
+        n++;
+        continue;
+      }
+      break;
+    }
+    const seat = s.currentTurn;
     const player = s.players[seat];
     const toCall = Math.min(s.toCall - player.contributed, player.stack);
     game.applyAction(
@@ -128,7 +138,15 @@ describe("Game state machine", () => {
     let safety = 0;
     while (game.snapshot().status === "preflop" && safety < 20) {
       const s = game.snapshot();
-      const seat = s.currentTurn!;
+      if (s.currentTurn === null) {
+        if (game.needsRunout()) {
+          game.advanceRunout();
+          safety++;
+          continue;
+        }
+        break;
+      }
+      const seat = s.currentTurn;
       if (seat === 5) {
         game.applyAction(seat, { action: "allIn" });
       } else {
@@ -186,5 +204,151 @@ describe("Game state machine", () => {
     foldUntilEnd(game);
     expect(game.snapshot().status).toBe("handEnded");
     expect(() => game.applyAction(0, { action: "fold" })).toThrow(/未开始/);
+  });
+
+  test("busted dealer moves button to next live seat", () => {
+    // Dealer = seat 4 busted; seats 0,1,2,3,5 alive. Button moves to 5.
+    const game = makeGame({
+      stacks: [100_000, 100_000, 100_000, 100_000, 0, 100_000],
+      dealer: 4,
+    });
+    game.startHand();
+    const snap = game.snapshot();
+    expect(snap.dealerSeat).toBe(5);
+    // Button live → SB=0, BB=1.
+    expect(snap.players[0].stack).toBe(99_500);
+    expect(snap.players[1].stack).toBe(99_000);
+  });
+
+  test("hero busted hands never start (waiting state preserved)", () => {
+    const game = makeGame({
+      stacks: [0, 100_000, 100_000, 100_000, 100_000, 100_000],
+      dealer: 4,
+    });
+    game.startHand(); // 5 live players, hand starts without hero
+    const snap = game.snapshot();
+    expect(snap.status).toBe("preflop");
+    // Hero never appears in the action order and can't act.
+    let safety = 0;
+    while (snap.status !== "handEnded" && safety < 60) {
+      const s = game.snapshot();
+      if (s.currentTurn === null) break;
+      const p = s.players[s.currentTurn];
+      const toCall = Math.min(s.toCall - p.contributed, p.stack);
+      game.applyAction(
+        s.currentTurn,
+        toCall > 0 ? { action: "call" } : { action: "check" },
+      );
+      safety++;
+    }
+    expect(game.snapshot().status).toBe("handEnded");
+  });
+
+  test("identical consecutive actions carry distinct seq numbers", () => {
+    const game = makeGame();
+    game.startHand();
+    // Seat 1 calls; then seat 2 calls with the same text.
+    let s = game.snapshot();
+    const actor = s.currentTurn!;
+    const toCall1 = Math.min(
+      s.toCall - s.players[actor].contributed,
+      s.players[actor].stack,
+    );
+    game.applyAction(
+      actor,
+      toCall1 > 0 ? { action: "call" } : { action: "check" },
+    );
+    const seqA = game.snapshot().lastAction?.seq;
+    s = game.snapshot();
+    const actor2 = s.currentTurn!;
+    const toCall2 = Math.min(
+      s.toCall - s.players[actor2].contributed,
+      s.players[actor2].stack,
+    );
+    game.applyAction(
+      actor2,
+      toCall2 > 0 ? { action: "call" } : { action: "check" },
+    );
+    const seqB = game.snapshot().lastAction?.seq;
+    expect(seqA).toBeDefined();
+    expect(seqB).toBeDefined();
+    expect(seqB).toBeGreaterThan(seqA!);
+  });
+
+  test("snapshot exposes blinds", () => {
+    const game = makeGame();
+    game.startHand();
+    expect(game.snapshot().blinds).toEqual({ small: 500, big: 1000 });
+  });
+
+  test("all-in runout is lazy: one board street per advanceRunout call", () => {
+    const game = makeGame({
+      stacks: [100_000, 10_000, 10_000, 10_000, 100_000, 100_000],
+    });
+    game.startHand();
+    // Seats 1-3 commit their whole stacks; big stacks fold. Once betting
+    // completes only all-in players remain, so the board must deal lazily.
+    const script: Record<number, "allIn" | "call"> = {
+      1: "allIn",
+      2: "call",
+      3: "call",
+    };
+    let safety = 0;
+    while (safety < 30) {
+      const s = game.snapshot();
+      if (s.status === "handEnded") break;
+      const seat = s.currentTurn;
+      if (seat === null) break;
+      const act = script[seat];
+      game.applyAction(seat, act ? { action: act } : { action: "fold" });
+      safety++;
+    }
+    let snap = game.snapshot();
+    expect(snap.status).toBe("flop");
+    expect(snap.currentTurn).toBeNull();
+    expect(snap.communityCards.length).toBe(3);
+    expect(game.needsRunout()).toBe(true);
+
+    game.advanceRunout();
+    snap = game.snapshot();
+    expect(snap.status).toBe("turn");
+    expect(snap.communityCards.length).toBe(4);
+
+    game.advanceRunout();
+    snap = game.snapshot();
+    expect(snap.status).toBe("river");
+    expect(snap.communityCards.length).toBe(5);
+    expect(game.needsRunout()).toBe(true);
+
+    game.advanceRunout();
+    snap = game.snapshot();
+    expect(snap.status).toBe("handEnded");
+    expect(snap.communityCards.length).toBe(5);
+    expect(game.getLastResult()?.winnerSeats.length).toBeGreaterThan(0);
+  });
+
+  test("showdown entries are sorted strongest hand first", () => {
+    const game = makeGame({ seed: 7 });
+    game.startHand();
+    callOrCheckUntil(game, "flop");
+    callOrCheckUntil(game, "turn");
+    callOrCheckUntil(game, "river");
+    callOrCheckUntil(game, "handEnded");
+    const result = game.getLastResult()!;
+    const showdown = result.showdown!;
+    expect(showdown.length).toBeGreaterThanOrEqual(2);
+    for (let i = 1; i < showdown.length; i++) {
+      const prev = showdown[i - 1];
+      const cur = showdown[i];
+      const prevValue = evaluate([
+        ...prev.cards,
+        ...game.snapshot().communityCards,
+      ]);
+      const curValue = evaluate([
+        ...cur.cards,
+        ...game.snapshot().communityCards,
+      ]);
+      expect(compareHands(prevValue, curValue)).toBeGreaterThanOrEqual(0);
+    }
   });
 });

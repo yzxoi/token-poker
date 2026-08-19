@@ -22,7 +22,7 @@ export function buildDecisionPrompt(
   const lines: string[] = [];
 
   lines.push(
-    `# 德州扑克决策（No-Limit，盲注 ${snapshot.minRaise === 1000 ? "500/1000" : "未知"}）`,
+    `# 德州扑克决策（No-Limit，盲注 ${snapshot.blinds.small}/${snapshot.blinds.big}）`,
   );
   lines.push(`你的身份：${style.name}（${style.persona}）`);
   lines.push(`你的手牌：${(me.holeCards ?? []).map(cardChar).join(" ")}`);

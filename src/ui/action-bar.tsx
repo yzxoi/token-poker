@@ -1,5 +1,5 @@
 /** Action bar: bet slider + Fold / Call / Bet buttons. */
-import { createMemo, createSignal, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, on, Show } from "solid-js";
 import type { Component } from "solid-js";
 import type { GameSnapshot } from "../engine/game";
 import { formatChips } from "./format";
@@ -39,6 +39,18 @@ export const ActionBar: Component<ActionBarProps> = (props) => {
     Math.min(maxBet(), props.snapshot.pot + toCall()),
   );
   const [selectedPreset, setSelectedPreset] = createSignal<number>(-1);
+
+  // Reset the bet input when a new hand begins so last hand's raise never
+  // carries into the next one.
+  createEffect(
+    on(
+      () => props.snapshot.handId,
+      () => {
+        setBetAmount(0);
+        setSelectedPreset(-1);
+      },
+    ),
+  );
 
   const applyPreset = (preset: number, index: number) => {
     setSelectedPreset(index);

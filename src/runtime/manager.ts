@@ -47,17 +47,7 @@ export class GameManager {
       const stored = await loadState(context);
       session = {
         scopeId,
-        game: new Game({
-          config: {
-            seats: 6,
-            smallBlind: SMALL_BLIND,
-            bigBlind: BIG_BLIND,
-            startingStack: STARTING_STACK,
-          },
-          dealerSeat: 4,
-          players: this.rosterPlayers(stored),
-          seed: handSeed(Math.floor(Date.now() / 1000), 1),
-        }),
+        game: this.restoreGame(stored),
         stored,
         handIndex: 1,
         nonce: Math.floor(Math.random() * 0xffffffff),
@@ -71,9 +61,42 @@ export class GameManager {
     return session;
   }
 
-  private rosterPlayers(
-    stored: StoredState,
-  ): {
+  /** Rebuild a Game from persisted state, or a fresh waiting game. */
+  private restoreGame(stored: StoredState): Game {
+    const recovery = stored.recovery;
+    if (!recovery) {
+      return new Game({
+        config: {
+          seats: 6,
+          smallBlind: SMALL_BLIND,
+          bigBlind: BIG_BLIND,
+          startingStack: STARTING_STACK,
+        },
+        dealerSeat: 4,
+        players: this.rosterPlayers(stored),
+        seed: handSeed(Math.floor(Date.now() / 1000), 0),
+      });
+    }
+    // Rebuild the mid-hand state we persisted on leave. The user hand is not
+    // replayed; a fresh recovery hand starts from the same financial
+    // position (stored.balance is authoritative for the user, stacks for AI).
+    const players = this.rosterPlayers(stored).map((p) =>
+      p.seat === 0 ? { ...p, stack: stored.balance } : p,
+    );
+    return new Game({
+      config: {
+        seats: 6,
+        smallBlind: SMALL_BLIND,
+        bigBlind: BIG_BLIND,
+        startingStack: STARTING_STACK,
+      },
+      dealerSeat: 4,
+      players,
+      seed: handSeed(Math.floor(Date.now() / 1000), 0),
+    });
+  }
+
+  private rosterPlayers(stored: StoredState): {
     seat: number;
     name: string;
     stack: number;
@@ -118,6 +141,7 @@ export class GameManager {
         ...p,
         holeCards: p.isBot ? null : p.holeCards,
       })),
+      revision: session.revision,
     };
   }
 
@@ -165,18 +189,86 @@ export class GameManager {
         await this.finishHand(context, session);
         return;
       }
-      if (turn === null) return;
+      if (turn === null) {
+        // No one can act: either an all-in runout is pending or the hand is
+        // waiting on the user. Deal the runout one street at a time so the
+        // UI can display each board street instead of jumping straight from
+        // preflop to settlement.
+        if (!session.game.needsRunout()) return;
+        await this.publishRunout(context, session);
+        if (session.game.snapshot().status === "handEnded") {
+          await this.finishHand(context, session);
+          return;
+        }
+        continue;
+      }
       const player = snap.players.find((p) => p.seat === turn)!;
       if (!player.isBot) return;
       const action = await this.decideFor(context, session, snap, turn, player);
       try {
         session.game.applyAction(turn, action);
       } catch {
-        // Defensive: fallback to fold if the LLM action is invalid.
-        session.game.applyAction(turn, { action: "fold" });
+        // The AI returned an invalid action (typically a raise below the
+        // minimum). Repair it into the closest legal action — folding here
+        // used to cascade: a few mis-bets in a row folded every opponent
+        // and ended the hand before the flop.
+        const repaired = this.repairAction(snap, player, action);
+        try {
+          session.game.applyAction(turn, repaired);
+        } catch {
+          try {
+            session.game.applyAction(turn, { action: "fold" });
+          } catch {
+            return;
+          }
+        }
       }
       this.publishChanged(context, session, this.publicSnapshot(session));
     }
+  }
+
+  /** Deal the remaining board one street at a time, publishing each street. */
+  private async publishRunout(
+    context: PluginInvocationContext,
+    session: GameSession,
+  ): Promise<void> {
+    while (session.game.needsRunout()) {
+      session.game.advanceRunout();
+      this.publishChanged(context, session, this.publicSnapshot(session));
+      if (session.game.snapshot().status === "handEnded") return;
+      // Pause between streets so the UI shows flop → turn → river progression.
+      await new Promise((r) => setTimeout(r, 900));
+    }
+  }
+
+  /**
+   * Repair an invalid AI action into the closest legal one. Bet amounts are
+   * treated as raise deltas: a bet that only matches the current bet becomes
+   * a call, an undersized raise is clamped up to the minimum raise (or the
+   * whole stack, which the engine always allows), and a zero bet with
+   * nothing to call becomes a check.
+   */
+  private repairAction(
+    snap: GameSnapshot,
+    player: PlayerState,
+    action: PlayerAction,
+  ): PlayerAction {
+    const toCallDelta = Math.max(0, snap.toCall - player.contributed);
+    if (action.action === "bet") {
+      const desired = Math.max(0, action.amount ?? 0);
+      if (toCallDelta > 0 && desired <= toCallDelta) {
+        return { action: "call" };
+      }
+      if (toCallDelta === 0 && desired <= 0) {
+        return { action: "check" };
+      }
+      const minLegal = toCallDelta + snap.minRaise;
+      const amount = Math.min(player.stack, Math.max(minLegal, desired));
+      if (amount > 0 && player.contributed + amount >= snap.toCall) {
+        return { action: "bet", amount };
+      }
+    }
+    return toCallDelta > 0 ? { action: "call" } : { action: "check" };
   }
 
   private async decideFor(
@@ -251,7 +343,15 @@ export class GameManager {
       players: this.rosterPlayers(session.stored),
       seed: handSeed(session.nonce, session.handIndex++),
     });
-    session.game.startHand();
+    try {
+      session.game.startHand();
+    } catch {
+      // Not enough live players (hero busted and nobody else can act):
+      // surface it as a snapshot in "waiting" state so the UI can offer a
+      // rebuy instead of a dead table.
+      this.publishChanged(context, session, this.publicSnapshot(session));
+      return this.publicSnapshot(session);
+    }
     this.publishChanged(context, session, this.publicSnapshot(session));
     await this.runAiLoop(context, session);
     return this.publicSnapshot(session);
@@ -317,17 +417,19 @@ export class GameManager {
         session.stored.recovery = this.publicSnapshot(session);
       }
       await saveState(context, session.stored);
-      this.sessions.delete(context.scopeId);
+      // Keep the in-memory session alive: every page/tab in this scope shares
+      // it, so one tab closing or reloading must not reset the table for the
+      // others. The AI loop only runs inside in-flight commands, so there is
+      // no background work to cancel here.
     });
   }
 
-  /** Current snapshot (query). Lock-free so UI refreshes during the AI chain. */
+  /**
+   * Current snapshot (query). Never starts hands and never writes state —
+   * queries are side-effect free; new hands are started by join/newHand.
+   */
   async get(context: PluginInvocationContext): Promise<GameSnapshot> {
     const session = await this.session(context);
-    const snap = session.game.snapshot();
-    if (snap.status === "waiting") {
-      return this.withLock(session, () => this.startNewHand(context, session));
-    }
     return this.publicSnapshot(session);
   }
 
@@ -343,6 +445,7 @@ export class GameManager {
     return this.withLock(session, async () => {
       session.stored.balance = STARTING_STACK;
       session.stored.stats = { hands: 0, won: 0, net: 0 };
+      session.stored.recovery = null;
       await saveState(context, session.stored);
     });
   }

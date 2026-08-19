@@ -1,6 +1,11 @@
 /** Poker page: joins the table, subscribes to events, renders table + action bar. */
-import { createSignal, onMount, onCleanup, Show } from "solid-js";
-import type { Component } from "solid-js";
+import {
+  createSignal,
+  onMount,
+  onCleanup,
+  Show,
+  type Component,
+} from "solid-js";
 import type { PluginSurfaceContext } from "@ericsanchezok/synergy-plugin/ui";
 import type { GameSnapshot } from "../engine/game";
 import { TableTop } from "./table-top";
@@ -17,68 +22,127 @@ const PokerPage: Component<PluginSurfaceContext> = (props) => {
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
 
+  let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+  let refreshInFlight = false;
+
+  /**
+   * Fetch and apply the current snapshot. Revisions come from the server so
+   * identical snapshots are dropped (stops the 1.5s flicker: every poll used
+   * to replace the snapshot object and re-run entry animations). Also
+   * suppresses the cascade of refresh() calls when an event fires while a
+   * fetch is already in flight — the in-flight fetch runs after the state
+   * change and is already the freshest.
+   */
   const refresh = async () => {
+    if (refreshInFlight) return;
+    refreshInFlight = true;
     try {
       const snap = (await props.operations.query(
         "game.get",
         {},
       )) as GameSnapshot;
-      setSnapshot(snap);
+      setSnapshot((prev) => (prev?.revision === snap.revision ? prev : snap));
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      refreshInFlight = false;
+      // Slow safety net (5s): events cover normal flow, this covers the rare
+      // missed/dropped event. The fast flicker came from polling at 1.5s.
+      if (refreshTimer !== undefined) clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(() => void refresh(), 5000);
     }
   };
 
   onMount(async () => {
-    try {
-      const snap = (await props.operations.command(
-        "game.join",
-        {},
-      )) as GameSnapshot;
-      setSnapshot(snap);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    }
+    // Subscribe BEFORE joining so we never miss state-change events fired
+    // while the (long-running, AI-loop-driving) join command is in flight.
     const unsubscribe = props.events.subscribe("game.state.changed", () => {
       void refresh();
     });
-    onCleanup(unsubscribe);
+    onCleanup(() => {
+      unsubscribe();
+      if (refreshTimer !== undefined) clearTimeout(refreshTimer);
+      // Leaving avoids keeping the server's AI loop (and LLM calls) running
+      // after the tab is closed.
+      void props.operations.command("game.leave", {}).catch(() => {});
+    });
+    try {
+      // Do not await: game.join drives the AI loop for the whole preflop
+      // betting round; the polling refresh loop shows actions as they happen.
+      void props.operations
+        .command("game.join", {})
+        .then((raw) => {
+          const snap = raw as GameSnapshot;
+          setSnapshot((prev) =>
+            prev?.revision === snap.revision ? prev : snap,
+          );
+        })
+        .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
   });
 
-  const act = async (
-    action: "fold" | "call" | "bet" | "check",
-    amount?: number,
-  ) => {
+  const act = (action: "fold" | "call" | "bet" | "check", amount?: number) => {
     setBusy(true);
-    try {
-      const snap = (await props.operations.command("game.action", {
-        action,
-        amount,
-      })) as GameSnapshot;
-      setSnapshot(snap);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-      await refresh();
-    } finally {
-      setBusy(false);
-    }
+    // Fire-and-forget: do NOT await the command. The server drives the whole
+    // AI loop inside the command response (tens of seconds), so awaiting it
+    // would freeze the UI until the entire betting round is over. The polling
+    // refresh loop keeps the table live while opponents act.
+    void props.operations
+      .command("game.action", { action, amount })
+      .then((raw) => {
+        const snap = raw as GameSnapshot;
+        setSnapshot((prev) => (prev?.revision === snap.revision ? prev : snap));
+        setBusy(false);
+      })
+      .catch(async (e) => {
+        setError(e instanceof Error ? e.message : String(e));
+        setBusy(false);
+        await refresh();
+      });
+    // Kick the poll loop immediately so opponent actions stream in.
+    void refresh();
   };
 
-  const newHand = async () => {
+  const newHand = () => {
     setBusy(true);
-    try {
-      const snap = (await props.operations.command(
-        "game.newHand",
-        {},
-      )) as GameSnapshot;
-      setSnapshot(snap);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-      await refresh();
-    } finally {
-      setBusy(false);
-    }
+    void props.operations
+      .command("game.newHand", {})
+      .then((raw) => {
+        const snap = raw as GameSnapshot;
+        setSnapshot((prev) => (prev?.revision === snap.revision ? prev : snap));
+        setBusy(false);
+      })
+      .catch(async (e) => {
+        setError(e instanceof Error ? e.message : String(e));
+        setBusy(false);
+        await refresh();
+      });
+    void refresh();
+  };
+
+  const rebuy = () => {
+    setBusy(true);
+    void props.operations
+      .command("game.rebuy", {})
+      .then(() => {
+        setBusy(false);
+        return newHand();
+      })
+      .catch((e) => {
+        setError(e instanceof Error ? e.message : String(e));
+        setBusy(false);
+      });
+  };
+
+  const heroBusted = () => {
+    const snap = snapshot();
+    if (!snap) return false;
+    const hero = snap.players.find((p) => p.seat === 0);
+    return !!hero && hero.stack <= 0;
   };
 
   return (
@@ -126,9 +190,19 @@ const PokerPage: Component<PluginSurfaceContext> = (props) => {
                 type="button"
                 class="tp-btn tp-btn--primary"
                 onClick={() => void newHand()}
+                disabled={heroBusted() && snapshot()!.status === "waiting"}
               >
                 下一手
               </button>
+              <Show when={heroBusted()}>
+                <button
+                  type="button"
+                  class="tp-btn tp-btn--ghost"
+                  onClick={() => void rebuy()}
+                >
+                  重新买入
+                </button>
+              </Show>
             </div>
           </Show>
         </div>

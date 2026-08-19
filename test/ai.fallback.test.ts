@@ -21,6 +21,7 @@ function snapshot(overrides: Partial<GameSnapshot> = {}): GameSnapshot {
     toCall: 0,
     minRaise: 1000,
     currentTurn: 1,
+    blinds: { small: 500, big: 1000 },
     lastAction: null,
     players: [
       {

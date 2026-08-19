@@ -61,8 +61,15 @@ export const gameSnapshotSchema = z.object({
       seat: z.number().int(),
       text: z.string(),
       amount: z.number().optional(),
+      action: z.enum(["fold", "check", "call", "bet", "allIn"]),
+      seq: z.number().int().nonnegative().optional(),
     })
     .nullable(),
+  blinds: z.object({
+    small: z.number(),
+    big: z.number(),
+  }),
+  revision: z.number().int().nonnegative().optional(),
   players: z.array(playerStateSchema),
   lastResult: handResultSchema.nullable(),
 });

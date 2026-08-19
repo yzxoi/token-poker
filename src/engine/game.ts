@@ -40,7 +40,17 @@ export interface GameSnapshot {
   toCall: number;
   minRaise: number;
   currentTurn: number | null;
-  lastAction: { seat: number; text: string; amount?: number } | null;
+  lastAction: {
+    seat: number;
+    text: string;
+    amount?: number;
+    action: PlayerActionType;
+    /** Monotonic per-game action counter so identical actions re-trigger UI. */
+    seq?: number;
+  } | null;
+  blinds: { small: number; big: number };
+  /** Server-side monotonic revision; present on snapshots from the runtime. */
+  revision?: number;
   players: PlayerState[];
   lastResult: HandResult | null;
 }
@@ -130,6 +140,10 @@ export class Game {
   private lastAction: GameSnapshot["lastAction"] = null;
   private handId: string;
   private lastResult: HandResult | null = null;
+  /** Effective dealer button for the current hand (moves if the dealer busts). */
+  private buttonSeat: number;
+  /** Monotonic counter assigned to every recorded action. */
+  private actionSeq = 0;
   /** Eligible players who still need to act in the current round. */
   private playersToAct = 0;
   /** True when the most recent action raised the current bet. */
@@ -138,6 +152,7 @@ export class Game {
   constructor(options: GameOptions) {
     this.config = { ...DEFAULT_CONFIG, ...options.config };
     this.dealerSeat = options.dealerSeat;
+    this.buttonSeat = options.dealerSeat;
     this.seed = options.seed;
     this.handId = `h-${options.seed.toString(36)}`;
     this.deck = freshDeck(options.seed);
@@ -163,13 +178,17 @@ export class Game {
     return {
       handId: this.handId,
       status: this.status,
-      dealerSeat: this.dealerSeat,
+      dealerSeat: this.buttonSeat,
       communityCards: [...this.community],
       pot: this.pot,
       toCall: this.toCall,
       minRaise: this.minRaise,
       currentTurn: this.currentTurn,
       lastAction: this.lastAction,
+      blinds: {
+        small: this.config.smallBlind,
+        big: this.config.bigBlind,
+      },
       players: this.seats.map((p) => ({
         seat: p.seat,
         name: p.name,
@@ -185,14 +204,24 @@ export class Game {
     };
   }
 
+  /** Record the latest action with a fresh monotonic seq. */
+  private recordAction(
+    seat: number,
+    text: string,
+    action: PlayerActionType,
+    amount?: number,
+  ): void {
+    this.lastAction = { seat, text, amount, action, seq: ++this.actionSeq };
+  }
+
   /** Start a new hand: post blinds, deal hole cards, set first actor. */
   startHand(): GameEvent[] {
     if (this.status !== "waiting") throw new Error("hand already started");
     const events: GameEvent[] = [];
-    const firstActive = this.seats
+    const activeSeats = this.seats
       .filter((p) => p.stack > 0)
       .map((p) => p.seat);
-    if (firstActive.length < 2)
+    if (activeSeats.length < 2)
       throw new Error("need at least 2 players with stack");
     for (const p of this.seats) {
       p.folded = false;
@@ -207,9 +236,20 @@ export class Game {
     this.deck = freshDeck(this.seed);
     this.justRaised = false;
 
-    const dealerIdx = firstActive.indexOf(this.dealerSeat);
-    const sbSeat = firstActive[(dealerIdx + 1) % firstActive.length];
-    const bbSeat = firstActive[(dealerIdx + 2) % firstActive.length];
+    // Move the button to the next live seat when the current dealer is busted.
+    if (!activeSeats.includes(this.buttonSeat)) {
+      for (let i = 1; i <= this.config.seats; i++) {
+        const candidate = (this.dealerSeat + i) % this.config.seats;
+        if (activeSeats.includes(candidate)) {
+          this.buttonSeat = candidate;
+          break;
+        }
+      }
+    }
+
+    const dealerIdx = activeSeats.indexOf(this.buttonSeat);
+    const sbSeat = activeSeats[(dealerIdx + 1) % activeSeats.length];
+    const bbSeat = activeSeats[(dealerIdx + 2) % activeSeats.length];
 
     const post = (seat: number, amount: number) => {
       const p = this.seat(seat);
@@ -228,7 +268,7 @@ export class Game {
     this.minRaise = this.config.bigBlind;
 
     for (let round = 0; round < 2; round++) {
-      for (const s of firstActive) {
+      for (const s of activeSeats) {
         this.seat(s).holeCards = [this.draw(), this.draw()];
       }
     }
@@ -237,10 +277,10 @@ export class Game {
     this.playersToAct = this.countEligible();
     // Heads-up: SB (dealer) acts first; otherwise the seat left of the BB.
     this.currentTurn =
-      firstActive.length === 2
-        ? this.dealerSeat
-        : firstActive[(dealerIdx + 3) % firstActive.length];
-    this.lastAction = { seat: bbSeat, text: `大盲 ${bb}`, amount: bb };
+      activeSeats.length === 2
+        ? this.buttonSeat
+        : activeSeats[(dealerIdx + 3) % activeSeats.length];
+    this.recordAction(bbSeat, `大盲 ${bb}`, "bet", bb);
     events.push({
       kind: "playerActed",
       seat: sbSeat,
@@ -265,9 +305,10 @@ export class Game {
     return this.deck[this.deckIndex++];
   }
 
-  /** Eligible = in the hand and able to act (not folded, not all-in). */
+  /** Eligible = in the hand, able to act, and holding chips. */
   private countEligible(): number {
-    return this.seats.filter((p) => !p.folded && !p.allIn).length;
+    return this.seats.filter((p) => !p.folded && !p.allIn && p.stack > 0)
+      .length;
   }
 
   /** Apply a player action. Returns events; throws on invalid action. */
@@ -287,23 +328,23 @@ export class Game {
     switch (action.action) {
       case "fold": {
         p.folded = true;
-        this.lastAction = { seat, text: "弃牌" };
+        this.recordAction(seat, "弃牌", "fold");
         events.push({ kind: "playerActed", seat, action: "fold" });
         break;
       }
       case "check": {
         if (toCall > 0) throw new Error("必须跟注或弃牌");
-        this.lastAction = { seat, text: "过牌" };
+        this.recordAction(seat, "过牌", "check");
         events.push({ kind: "playerActed", seat, action: "check" });
         break;
       }
       case "call": {
         if (toCall <= 0) {
-          this.lastAction = { seat, text: "过牌" };
+          this.recordAction(seat, "过牌", "check");
           events.push({ kind: "playerActed", seat, action: "check" });
         } else {
           const paid = this.putIn(seat, toCall);
-          this.lastAction = { seat, text: `跟注 ${paid}`, amount: paid };
+          this.recordAction(seat, `跟注 ${paid}`, "call", paid);
           events.push({
             kind: "playerActed",
             seat,
@@ -333,7 +374,7 @@ export class Game {
           this.minRaise = Math.max(this.minRaise, p.contributed - this.toCall);
           this.toCall = p.contributed;
         }
-        this.lastAction = { seat, text: `下注 ${paid}`, amount: paid };
+        this.recordAction(seat, `下注 ${paid}`, "bet", paid);
         events.push({ kind: "playerActed", seat, action: "bet", amount: paid });
         break;
       }
@@ -344,7 +385,7 @@ export class Game {
           this.minRaise = Math.max(this.minRaise, p.contributed - this.toCall);
           this.toCall = p.contributed;
         }
-        this.lastAction = { seat, text: `全下 ${paid}`, amount: paid };
+        this.recordAction(seat, `全下 ${paid}`, "allIn", paid);
         events.push({
           kind: "playerActed",
           seat,
@@ -372,10 +413,10 @@ export class Game {
     return actual;
   }
 
-  /** Actors in order starting left of the dealer, wrapping. */
+  /** Actors in order starting left of the effective dealer button, wrapping. */
   private actionOrder(): number[] {
     const seats = [...Array(this.config.seats).keys()];
-    const start = (this.dealerSeat + 1) % this.config.seats;
+    const start = (this.buttonSeat + 1) % this.config.seats;
     return [...seats.slice(start), ...seats.slice(0, start)];
   }
 
@@ -386,7 +427,7 @@ export class Game {
     for (let i = 0; i < order.length; i++) {
       const seat = order[(start + i) % order.length];
       const p = this.seat(seat);
-      if (!p.folded && !p.allIn) return seat;
+      if (!p.folded && !p.allIn && p.stack > 0) return seat;
     }
     return null;
   }
@@ -394,7 +435,14 @@ export class Game {
   /** True when every eligible player has matched the current bet. */
   private allMatched(): boolean {
     for (const p of this.seats) {
-      if (!p.folded && !p.allIn && p.contributed !== this.toCall) return false;
+      if (
+        !p.folded &&
+        !p.allIn &&
+        p.stack > 0 &&
+        p.contributed !== this.toCall
+      ) {
+        return false;
+      }
     }
     return true;
   }
@@ -433,7 +481,9 @@ export class Game {
     if (this.playersToAct > 0 || !this.allMatched()) {
       const next = this.nextEligible(this.currentTurn);
       if (next === null) {
-        events.push(...this.runOutBoard());
+        // No eligible player can act (everyone else all-in or folded): the
+        // remaining board is dealt lazily via needsRunout()/advanceRunout().
+        this.currentTurn = null;
         return events;
       }
       this.currentTurn = next;
@@ -467,37 +517,55 @@ export class Game {
     }
     this.playersToAct = this.countEligible();
     const headsUp =
-      nonFolded.length === 2 && !this.seat(this.dealerSeat).folded;
-    const first = headsUp
-      ? this.dealerSeat
-      : this.nextEligible(this.dealerSeat);
+      nonFolded.length === 2 && !this.seat(this.buttonSeat).folded;
+    const first =
+      headsUp && !this.seat(this.buttonSeat).allIn
+        ? this.buttonSeat
+        : this.nextEligible(this.buttonSeat);
     if (first === null) {
-      events.push(...this.runOutBoard());
+      // All-in runout: deal the remaining board lazily, one street at a time.
+      this.currentTurn = null;
       return events;
     }
     this.currentTurn = first;
     return events;
   }
 
-  /** Deal remaining community cards when no betting remains (all-in). */
-  private runOutBoard(): GameEvent[] {
+  /**
+   * True when betting is complete but board cards still need to be dealt
+   * (all-in runout). The caller drives the board one street at a time via
+   * advanceRunout() so the UI can display each street.
+   */
+  needsRunout(): boolean {
+    if (this.currentTurn !== null) return false;
+    if (
+      this.status !== "preflop" &&
+      this.status !== "flop" &&
+      this.status !== "turn" &&
+      this.status !== "river"
+    ) {
+      return false;
+    }
+    if (this.seats.filter((p) => !p.folded).length <= 1) return false;
+    return this.countEligible() === 0;
+  }
+
+  /** Deal exactly one more board street (or settle at the river). */
+  advanceRunout(): GameEvent[] {
     const events: GameEvent[] = [];
     if (this.status === "preflop") {
       this.community.push(this.draw(), this.draw(), this.draw());
       this.status = "flop";
       events.push({ kind: "streetChanged", status: "flop" });
-    }
-    if (this.status === "flop") {
+    } else if (this.status === "flop") {
       this.community.push(this.draw());
       this.status = "turn";
       events.push({ kind: "streetChanged", status: "turn" });
-    }
-    if (this.status === "turn") {
+    } else if (this.status === "turn") {
       this.community.push(this.draw());
       this.status = "river";
       events.push({ kind: "streetChanged", status: "river" });
-    }
-    if (this.status === "river") {
+    } else if (this.status === "river") {
       this.status = "showdown";
       events.push(...this.settle());
     }
@@ -532,22 +600,34 @@ export class Game {
       this.seat(seat).stack += amount;
     }
 
+    // Ranked showdown: strongest hand first, so the UI can render a sorted
+    // list without re-evaluating. Ties keep their seat order.
+    const showdownEntries = nonFolded
+      .filter((p) => p.holeCards)
+      .map((p) => {
+        const cards = [...(p.holeCards ?? [])];
+        const value = evaluate([...cards, ...this.community]);
+        return {
+          seat: p.seat,
+          cards,
+          handName: handName(value),
+          bestHand: bestFive(cards, this.community),
+          value,
+        };
+      })
+      .sort((a, b) => compareHands(b.value, a.value))
+      .map(({ seat, cards, handName: name, bestHand }) => ({
+        seat,
+        cards,
+        handName: name,
+        bestHand,
+      }));
+
     const result: HandResult = {
       winnerSeats: [...totals.keys()],
       winningAmounts: [...totals.keys()].map((s) => totals.get(s)!),
       potSplits: splits,
-      showdown: nonFolded
-        .filter((p) => p.holeCards)
-        .map((p) => {
-          const cards = [...(p.holeCards ?? [])];
-          const value = evaluate([...cards, ...this.community]);
-          return {
-            seat: p.seat,
-            cards,
-            handName: handName(value),
-            bestHand: bestFive(cards, this.community),
-          };
-        }),
+      showdown: showdownEntries,
     };
     this.lastResult = result;
     this.status = "handEnded";

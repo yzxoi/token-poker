@@ -91,28 +91,50 @@ export function decideFallback(ctx: DecisionContext): PlayerAction {
     (toCall / Math.max(snapshot.pot, 1)) * 0.35 -
     TIGHTNESS[style.aggression];
 
+  /**
+   * Return a legal bet action for `preferred` (a raise-size delta), or null
+   * when this player cannot raise. The engine requires: amount <= stack,
+   * contributed + amount >= toCall, and any raise over toCall to reach at
+   * least minRaise (an all-in raise of the whole stack is always allowed).
+   */
+  const legalBet = (preferred: number): PlayerAction | null => {
+    if (preferred <= toCall) return null;
+    if (player.stack <= toCall) return null; // can only call all-in
+    const minRaiseDelta =
+      snapshot.toCall + snapshot.minRaise - player.contributed;
+    if (player.stack <= minRaiseDelta) {
+      // All-in raise: always legal even below the minimum raise.
+      return { action: "bet", amount: player.stack };
+    }
+    return {
+      action: "bet",
+      amount: Math.min(player.stack, Math.max(minRaiseDelta, preferred)),
+    };
+  };
+
   if (strength >= STRONG_THRESHOLD) {
-    // Strong: raise ~pot, or all-in if pot-sized bet exceeds stack.
-    const raiseAmount = Math.min(
+    // Strong: raise ~pot, or all-in if the pot-sized raise reaches the stack.
+    const preferred = Math.min(
       player.stack,
       Math.max(snapshot.pot, snapshot.toCall * 2),
     );
-    if (toCall > 0 && raiseAmount <= toCall && player.stack > toCall) {
-      return { action: "call" };
+    if (preferred >= player.stack && player.stack > 0) {
+      return { action: "allIn" };
     }
-    if (raiseAmount >= player.stack) return { action: "allIn" };
-    if (raiseAmount > 0 && player.contributed + raiseAmount < snapshot.toCall) {
-      return { action: "call" };
-    }
-    return { action: "bet", amount: Math.max(raiseAmount, snapshot.toCall) };
+    return (
+      legalBet(preferred) ??
+      (toCall > 0 ? { action: "call" } : { action: "check" })
+    );
   }
 
   if (strength >= MARGINAL_THRESHOLD) {
-    // Marginal: mostly call/check, aggressive styles raise sometimes.
+    // Marginal: mostly call/check, aggressive styles raise sometimes. The
+    // raise is clamped to a legal size (>= min-raise) before returning.
     const raiseProb = style.raiseBias * 0.4;
     if (rand < raiseProb) {
-      const amount = Math.min(player.stack, Math.round(snapshot.pot * 0.6));
-      if (amount > toCall) return { action: "bet", amount };
+      const preferred = Math.min(player.stack, Math.round(snapshot.pot * 0.6));
+      const raised = legalBet(preferred);
+      if (raised) return raised;
     }
     return toCall > 0 ? { action: "call" } : { action: "check" };
   }
@@ -124,9 +146,10 @@ export function decideFallback(ctx: DecisionContext): PlayerAction {
       return { action: "call" };
     }
     if (rand < style.bluffBias && player.stack > snapshot.pot) {
-      // Bluff-raise.
-      const amount = Math.min(player.stack, Math.round(snapshot.pot * 0.8));
-      if (amount > toCall) return { action: "bet", amount };
+      // Bluff-raise, clamped to a legal size.
+      const preferred = Math.min(player.stack, Math.round(snapshot.pot * 0.8));
+      const raised = legalBet(preferred);
+      if (raised) return raised;
     }
     return { action: "fold" };
   }
