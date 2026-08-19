@@ -22,7 +22,7 @@ const AGENT_PROMPT = `你是一名德州扑克（No-Limit Hold'em）对手决策
 
 export default definePlugin({
   id: "token-poker",
-  version: "0.1.0",
+  version: "0.1.1",
   name: "Token Poker",
   description: "Agent 陪玩的虚拟筹码德州扑克（Earn Tokens 风格）",
   author: "yzxoi",
