@@ -2,7 +2,7 @@
 
 Agent 陪玩的虚拟筹码德州扑克（Earn Tokens 风格），Synergy Plugin API 4 插件。
 
-![6-max 牌桌](docs/screenshot.png)
+<img width="1792" height="1265" alt="Screenshot 2026-08-19 at 19 54 26" src="https://github.com/user-attachments/assets/0ae0f3d4-c9c7-4df3-8ea0-2dcbe989e408" />
 
 ## 功能
 
