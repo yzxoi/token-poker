@@ -22,7 +22,7 @@ const AGENT_PROMPT = `你是一名德州扑克（No-Limit Hold'em）对手决策
 
 export default definePlugin({
   id: "token-poker",
-  version: "0.1.1",
+  version: "0.1.2",
   name: "Token Poker",
   description: "Agent 陪玩的虚拟筹码德州扑克（Earn Tokens 风格）",
   author: "yzxoi",
@@ -110,6 +110,10 @@ export default definePlugin({
       output: {},
       handler: (_input, context) => gameManager.rebuy(context),
     }),
+    // Icon registers before the navigation item that references it, so the
+    // host icon registry is populated before the sidebar first renders the
+    // entry (registration-order race caused an intermittently empty icon).
+    icon({ id: "poker", path: "icons/poker.svg" }),
     navigationItem({
       id: "poker",
       label: "Poker",
@@ -117,6 +121,5 @@ export default definePlugin({
       icon: "poker",
       component: { source: "./src/ui/poker-page.tsx" },
     }),
-    icon({ id: "poker", path: "icons/poker.svg" }),
   ],
 });
